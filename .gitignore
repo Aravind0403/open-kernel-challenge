@@ -1,3 +1,9 @@
 serving/sglang
 *.log
 *.json
+*.pdf
+__pycache__/
+*.pyc
+.DS_Store
+*/profiles/
+profiles/
