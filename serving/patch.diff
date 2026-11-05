@@ -1,0 +1,22 @@
+diff --git a/python/sglang/srt/layers/muse_spark_fp4_moe.py b/python/sglang/srt/layers/muse_spark_fp4_moe.py
+index 97b1474..0c30c45 100644
+--- a/python/sglang/srt/layers/muse_spark_fp4_moe.py
++++ b/python/sglang/srt/layers/muse_spark_fp4_moe.py
+@@ -474,9 +474,14 @@ class MuseSpark1xFp4Experts(nn.Module):
+         local_topk_ids = local_topk_ids.contiguous()
+         topk_weights = topk_scores.to(torch.float32).contiguous()
+ 
+-        for block_size_m in _MARLIN_BLOCK_SIZE_M_CANDIDATES:
+-            if num_tokens * topk / self.num_local_experts / block_size_m < 0.9:
+-                break
++        if num_tokens == 32:
++            block_size_m = 16
++        elif num_tokens in (128, 256):
++            block_size_m = 32
++        else:
++            for block_size_m in _MARLIN_BLOCK_SIZE_M_CANDIDATES:
++                if num_tokens * topk / self.num_local_experts / block_size_m < 0.9:
++                    break
+ 
+         if num_tokens == 1 and topk <= 32 and expert_map is None:
+             from sglang.kernels.ops.moe.moe_align_single_token import (
