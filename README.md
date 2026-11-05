@@ -5,7 +5,7 @@
 [![Challenge](https://img.shields.io/badge/Sponsors-Meta%20%C3%97%20Paradigm%20%C3%97%20Andromeda-6366f1?style=for-the-badge)](#)
 [![Status](https://img.shields.io/badge/Verified%20Solutions-4%2F4%20Decode%20Problems-success?style=for-the-badge)](#)
 
-High-performance GPU kernel engineering and distributed inference server optimization for **Muse Spark Open (816B Parameter Sparse Mixture-of-Experts)** on **NVIDIA Hopper H200** GPUs.
+High-performance GPU kernel engineering and layer-level inference acceleration for **Muse Spark Open (816B Parameter Sparse Mixture-of-Experts shapes)** on **NVIDIA Hopper H200** GPUs.
 
 ---
 
@@ -66,42 +66,17 @@ Each problem reports an **official composite speedup** across its entire test su
 
 ```text
 open-kernel-challenge/
-├── README.md                            # Comprehensive project overview and benchmarks
-├── Open_Kernel_Challenge_Masterclass.html # Full 11-page masterclass on GPU architecture & kernels
+├── README.md                            # Project overview and official benchmark standings
 ├── muse_decode_layer/                   # Full Transformer Layer optimization (Rank #1164)
-│   ├── submission.py                   # Verified dual-stream submission
+│   ├── submission.py                   # Verified dual-stream submission (1.193x composite)
 │   └── TASK.md                         # Problem specification
 ├── muse_moe_w4a16/                     # Mixture-of-Experts W4A16 optimization (Rank #1299)
-│   ├── submission.py                   # Verified Marlin block-size tuned submission
+│   ├── submission.py                   # Verified Marlin block-size tuned submission (1.256x composite)
 │   └── TASK.md
 ├── muse_bf16_proj/                     # Router & Unpooler GEMV optimization (Rank #1586)
-│   ├── submission.py                   # Verified 128-bit vectorized CUDA kernels
+│   ├── submission.py                   # Verified 128-bit vectorized CUDA kernels (1.108x composite)
 │   └── TASK.md
-├── muse_attention_decode/              # Attention & Norm pipeline optimization (Rank #1361)
-│   ├── submission.py                   # Verified in-place RMSNorm-Gate fusion
-│   └── TASK.md
-└── serving/                            # Serving Track (Opens Nov 10, 8xH200 SGLang Server)
-    ├── RULES.md                        # Official judge rules, timeouts, and flags
-    ├── custom_kernels.py               # Fused CUDA kernels ready for SGLang integration
-    └── patch.diff                      # SGLang patch validated by `okc serve diff`
+└── muse_attention_decode/              # Attention & Norm pipeline optimization (Rank #1361)
+    ├── submission.py                   # Verified in-place RMSNorm-Gate fusion (1.090x composite)
+    └── TASK.md
 ```
-
----
-
-## ⚡ Serving Track (Staged, Opens Nov 10)
-
-The Serving Track evaluates end-to-end server throughput on an **8×H200 multi-GPU node** serving multi-turn coding chats with **DFlash Speculative Decoding (draft length 8)**.
-
-* **Status:** Staged on branch `my-patch` and format-validated via `okc serve diff`. Awaiting live cluster evaluation when the track opens on **November 10 at 9:00 AM PT**.
-* **Target Hotspot:** DFlash verification executes at batch size $M=8$ on every step.
-* **Optimization Vectors:**
-  1. Tiled Shared-Memory GEMV for $M=8$ (caching weights in SRAM to prevent L2 cache thrashing).
-  2. Marlin `block_size_m = 32` integration into SGLang's `layers/moe/moe_runner/marlin.py`.
-  3. Fused QK-Norm + RoPE + FP8 Quantization Triton kernels in `models/muse_spark.py`.
-  4. Full compatibility with SGLang CUDA Graphs and Tensor Parallelism (TP=8).
-
----
-
-## 📖 Deep-Dive Masterclass
-For a first-principles breakdown of Hopper H200 architecture, warp-level primitives, and kernel walkthroughs, view the complete guide:
-* **[Open_Kernel_Challenge_Masterclass.html](Open_Kernel_Challenge_Masterclass.html)**

@@ -2,6 +2,7 @@ serving/sglang
 *.log
 *.json
 *.pdf
+*.html
 __pycache__/
 *.pyc
 .DS_Store
