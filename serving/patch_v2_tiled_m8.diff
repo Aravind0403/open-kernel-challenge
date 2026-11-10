@@ -1,6 +1,6 @@
 diff --git a/python/sglang/kernels/ops/muse_spark_v12/tiled_m8_gemv.py b/python/sglang/kernels/ops/muse_spark_v12/tiled_m8_gemv.py
 new file mode 100644
-index 0000000..635751a
+index 00000000..635751a8
 --- /dev/null
 +++ b/python/sglang/kernels/ops/muse_spark_v12/tiled_m8_gemv.py
 @@ -0,0 +1,172 @@
@@ -176,11 +176,11 @@ index 0000000..635751a
 +
 +
 +__all__ = ["fast_tiled_m8_gemv"]
-diff --git a/python/sglang/srt/layers/muse_spark_fp4_moe.py b/python/sglang/srt/layers/muse_spark_fp4_moe.py
-index 97b1474..0c30c45 100644
---- a/python/sglang/srt/layers/muse_spark_fp4_moe.py
-+++ b/python/sglang/srt/layers/muse_spark_fp4_moe.py
-@@ -474,9 +474,14 @@ class MuseSpark1xFp4Experts(nn.Module):
+diff --git a/python/sglang/srt/layers/muse_spark/muse_spark_fp4_moe.py b/python/sglang/srt/layers/muse_spark/muse_spark_fp4_moe.py
+index 41c463dc..0044b58d 100644
+--- a/python/sglang/srt/layers/muse_spark/muse_spark_fp4_moe.py
++++ b/python/sglang/srt/layers/muse_spark/muse_spark_fp4_moe.py
+@@ -407,9 +407,14 @@ class MuseSpark1xFp4Experts(nn.Module):
          local_topk_ids = local_topk_ids.contiguous()
          topk_weights = topk_scores.to(torch.float32).contiguous()
  
@@ -199,10 +199,10 @@ index 97b1474..0c30c45 100644
          if num_tokens == 1 and topk <= 32 and expert_map is None:
              from sglang.kernels.ops.moe.moe_align_single_token import (
 diff --git a/python/sglang/srt/models/muse_spark.py b/python/sglang/srt/models/muse_spark.py
-index 312b342..e4d0f42 100644
+index 6b638e9f..12bd55d6 100644
 --- a/python/sglang/srt/models/muse_spark.py
 +++ b/python/sglang/srt/models/muse_spark.py
-@@ -284,6 +284,12 @@ class MuseSpark1xRouter(nn.Module):
+@@ -240,6 +240,12 @@ class MuseSpark1xRouter(nn.Module):
      def forward_split2(self, hidden_states: torch.Tensor) -> torch.Tensor:
          self._build_split2()
          x = hidden_states.to(torch.bfloat16)

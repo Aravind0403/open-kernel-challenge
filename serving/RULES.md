@@ -1,7 +1,7 @@
 # The serving track
 
 Make SGLang serve Muse Spark Open faster. Your submission is a patch to the SGLang checkout in
-`sglang/`, at commit `a55ab7d5`, the one LMSYS's image `lmsysorg/sglang:dev-muse-spark-open`
+`sglang/`, at commit `297e54fd`, the one LMSYS's image `lmsysorg/sglang:dev-muse-spark-open`
 serves the model with. Edit it, then:
 
     okc serve diff                     # writes patch.diff
@@ -24,9 +24,10 @@ SGLang (`pip install -e sglang/python --no-deps`):
       --speculative-draft-model-path RadixArk/Muse-Spark-Open-DFlash2 --tp-size 8 --ep-size 8 \
       --quantization modelopt_fp4 --moe-runner-backend marlin --mem-fraction-static 0.85 \
       --speculative-algorithm DFLASH --speculative-num-draft-tokens 8 \
-      --enable-hierarchical-cache --chunked-prefill-size 16384 --context-length 131072 \
-      --enable-cache-report --incremental-streaming-output --random-seed 1234 \
-      --max-running-requests 32 --cuda-graph-max-bs-decode 32
+      --speculative-draft-attention-backend fa4 --mm-feature-transport cpu \
+      --enable-hierarchical-cache --hicache-size 160 --chunked-prefill-size 16384 \
+      --context-length 131072 --enable-cache-report --incremental-streaming-output \
+      --random-seed 1234 --max-running-requests 32 --cuda-graph-max-bs-decode 32
 
 These are the judge's flags. Your patch can change what they do, not the flags themselves.
 To load it, `python -m sglang.bench_serving --backend sglang --max-concurrency 16` is a
