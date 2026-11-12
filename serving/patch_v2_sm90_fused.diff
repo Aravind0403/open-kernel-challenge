@@ -1,0 +1,1011 @@
+diff --git a/python/sglang/kernels/jit/csrc/muse_spark/post_expert_finalize.cuh b/python/sglang/kernels/jit/csrc/muse_spark/post_expert_finalize.cuh
+new file mode 100644
+index 00000000..1898e056
+--- /dev/null
++++ b/python/sglang/kernels/jit/csrc/muse_spark/post_expert_finalize.cuh
+@@ -0,0 +1,293 @@
++/**
++ * \brief Fused post-expert RMSNorm + active-slot weighted combine for MuseSpark MoE.
++ *
++ * Replaces the multi-pass Triton / PyTorch finalize with a single-pass CTA kernel
++ * (1 block per token) featuring Programmatic Dependent Launch (PDL), early warp
++ * ballot over active slots (skipping inactive padded/remote HBM reads and fast
++ * zeroing empty tokens), register-resident normalization, and SM90-friendly
++ * 16-byte vectorized BF16 memory traffic.
++ */
++
++#pragma once
++
++#include <sgl_kernel/tensor.h>
++#include <sgl_kernel/utils.h>
++
++#include <sgl_kernel/cta.cuh>
++#include <sgl_kernel/math.cuh>
++#include <sgl_kernel/type.cuh>
++#include <sgl_kernel/utils.cuh>
++#include <sgl_kernel/vec.cuh>
++#include <sgl_kernel/warp.cuh>
++
++#include <tvm/ffi/container/tensor.h>
++#include <tvm/ffi/optional.h>
++
++#include <cstdint>
++
++namespace sglang {
++
++namespace muse_spark {
++
++struct PostExpertFinalizeParams {
++  const void* __restrict__ expert_output;
++  const void* __restrict__ norm_weight;
++  const void* __restrict__ topk_scores;
++  void* __restrict__ out;
++  const int32_t* __restrict__ slot_expert_ids;
++  float eps;
++  int num_tokens;
++  bool scores_bf16;
++  bool round_product;
++};
++
++// kNormMode:
++//   0: no norm (y = x)
++//   1: apply_norm, no norm_weight (y = rms_norm(x))
++//   2: apply_norm, weight second (y = rms_norm(x) * w)
++//   3: apply_norm, weight first (y = rms_norm(w * x))
++template <int64_t kHidden, int kNumThreads, int kTopK, int kNormMode, bool kUsePDL>
++__global__ void __launch_bounds__(kNumThreads)
++    post_expert_finalize_kernel(const __grid_constant__ PostExpertFinalizeParams params) {
++  constexpr int kVec = 8;
++  constexpr int kPairs = kVec / 2;
++  constexpr int kPacks = static_cast<int>(kHidden / (kNumThreads * kVec));
++  constexpr int kNumWarps = kNumThreads / static_cast<int>(device::kWarpThreads);
++  constexpr bool kApplyNorm = (kNormMode != 0);
++  constexpr bool kHasWeight = (kNormMode >= 2);
++  constexpr bool kWeightFirst = (kNormMode == 3);
++  constexpr int kSmemSlots = (kApplyNorm && kNumWarps > 1) ? kNumWarps : 1;
++
++  static_assert(kHidden > 0 && kHidden % (kNumThreads * kVec) == 0);
++  static_assert(kNumThreads % device::kWarpThreads == 0 && kNumThreads <= 1024);
++  static_assert(kTopK >= 1 && kTopK <= 32);
++  static_assert(kNormMode >= 0 && kNormMode <= 3);
++
++  using BF16Vec = device::AlignedVector<bf16x2_t, kPairs>;
++
++  const int tok = static_cast<int>(blockIdx.x);
++  if (tok >= params.num_tokens) return;
++
++  const uint32_t lane = device::get_lane_id();
++  const int64_t tok_topk = static_cast<int64_t>(tok) * kTopK;
++  const int64_t out_base = static_cast<int64_t>(tok) * kHidden;
++  auto* __restrict__ out_ptr = static_cast<bf16_t*>(params.out) + out_base;
++
++  // Order reads against the upstream Marlin/scatter GEMM2 kernel on this stream.
++  device::PDLWaitPrimary<kUsePDL>();
++
++  uint32_t live_mask = (kTopK == 32) ? device::warp::kFullMask : ((1u << kTopK) - 1u);
++  if (params.slot_expert_ids != nullptr) {
++    const bool ok = (lane < static_cast<uint32_t>(kTopK)) &&
++                    (params.slot_expert_ids[tok_topk + lane] >= 0);
++    live_mask = __ballot_sync(device::warp::kFullMask, ok);
++  }
++
++  if (live_mask == 0u) {
++    BF16Vec zero_vec;
++    zero_vec.fill(device::cast<bf16x2_t>(make_float2(0.0f, 0.0f)));
++#pragma unroll
++    for (int p = 0; p < kPacks; ++p) {
++      zero_vec.store(out_ptr, threadIdx.x + p * kNumThreads);
++    }
++    device::PDLTriggerSecondary<kUsePDL>();
++    return;
++  }
++
++  float my_score = 0.0f;
++  if ((live_mask >> lane) & 1u) {
++    if (params.scores_bf16) {
++      const auto s_bf16 = static_cast<const bf16_t*>(params.topk_scores)[tok_topk + lane];
++      my_score = device::cast<fp32_t>(s_bf16);
++    } else {
++      my_score = static_cast<const float*>(params.topk_scores)[tok_topk + lane];
++    }
++  }
++
++  BF16Vec w_vec[kHasWeight ? kPacks : 1];
++  if constexpr (kHasWeight) {
++    const auto* __restrict__ w_ptr = static_cast<const bf16_t*>(params.norm_weight);
++#pragma unroll
++    for (int p = 0; p < kPacks; ++p) {
++      w_vec[p].load(w_ptr, threadIdx.x + p * kNumThreads);
++    }
++  }
++
++  fp32x2_t acc[kPacks][kPairs];
++#pragma unroll
++  for (int p = 0; p < kPacks; ++p) {
++#pragma unroll
++    for (int q = 0; q < kPairs; ++q) {
++      acc[p][q] = make_float2(0.0f, 0.0f);
++    }
++  }
++
++  // Two ping-pong buffers avoid an extra trailing barrier after cta::reduce_sum:
++  // iteration m+2 cannot overwrite smem_red[m%2] before passing the m+1 barrier.
++  __shared__ float smem_red[2][kSmemSlots];
++  int parity = 0;
++
++  uint32_t rem = live_mask;
++  while (rem != 0u) {
++    const int k = __ffs(static_cast<int>(rem)) - 1;
++    rem &= rem - 1u;
++    const float s = __shfl_sync(device::warp::kFullMask, my_score, k);
++    const int64_t slot_base = (tok_topk + k) * kHidden;
++    const auto* __restrict__ x_ptr = static_cast<const bf16_t*>(params.expert_output) + slot_base;
++
++    if constexpr (!kApplyNorm) {
++#pragma unroll
++      for (int p = 0; p < kPacks; ++p) {
++        BF16Vec x_vec;
++        x_vec.load(x_ptr, threadIdx.x + p * kNumThreads);
++#pragma unroll
++        for (int q = 0; q < kPairs; ++q) {
++          const fp32x2_t y = device::cast<fp32x2_t>(x_vec[q]);
++          fp32x2_t prod = make_float2(y.x * s, y.y * s);
++          if (params.round_product) {
++            prod = device::cast<fp32x2_t>(device::cast<bf16x2_t>(prod));
++          }
++          acc[p][q].x += prod.x;
++          acc[p][q].y += prod.y;
++        }
++      }
++    } else {
++      fp32x2_t row_vals[kPacks][kPairs];
++      float sum_sq = 0.0f;
++#pragma unroll
++      for (int p = 0; p < kPacks; ++p) {
++        BF16Vec x_vec;
++        x_vec.load(x_ptr, threadIdx.x + p * kNumThreads);
++#pragma unroll
++        for (int q = 0; q < kPairs; ++q) {
++          fp32x2_t v = device::cast<fp32x2_t>(x_vec[q]);
++          if constexpr (kHasWeight && kWeightFirst) {
++            const fp32x2_t w = device::cast<fp32x2_t>(w_vec[p][q]);
++            v.x *= w.x;
++            v.y *= w.y;
++          }
++          row_vals[p][q] = v;
++          sum_sq = fmaf(v.x, v.x, sum_sq);
++          sum_sq = fmaf(v.y, v.y, sum_sq);
++        }
++      }
++
++      sum_sq = device::cta::reduce_sum<kNumThreads>(sum_sq, smem_red[parity]);
++      parity ^= 1;
++      const float rstd = device::math::rsqrt(sum_sq / static_cast<float>(kHidden) + params.eps);
++
++#pragma unroll
++      for (int p = 0; p < kPacks; ++p) {
++#pragma unroll
++        for (int q = 0; q < kPairs; ++q) {
++          fp32x2_t y = make_float2(row_vals[p][q].x * rstd, row_vals[p][q].y * rstd);
++          if constexpr (kHasWeight && !kWeightFirst) {
++            const fp32x2_t w = device::cast<fp32x2_t>(w_vec[p][q]);
++            y.x *= w.x;
++            y.y *= w.y;
++          }
++          fp32x2_t prod = make_float2(y.x * s, y.y * s);
++          if (params.round_product) {
++            prod = device::cast<fp32x2_t>(device::cast<bf16x2_t>(prod));
++          }
++          acc[p][q].x += prod.x;
++          acc[p][q].y += prod.y;
++        }
++      }
++    }
++  }
++
++#pragma unroll
++  for (int p = 0; p < kPacks; ++p) {
++    BF16Vec out_vec;
++#pragma unroll
++    for (int q = 0; q < kPairs; ++q) {
++      out_vec[q] = device::cast<bf16x2_t>(acc[p][q]);
++    }
++    out_vec.store(out_ptr, threadIdx.x + p * kNumThreads);
++  }
++  device::PDLTriggerSecondary<kUsePDL>();
++}
++
++}  // namespace muse_spark
++
++template <int64_t kHidden, int kNumThreads, int kTopK, int kNormMode, bool kUsePDL>
++void fused_post_expert_norm_weighted_sum(
++    const tvm::ffi::TensorView expert_output,
++    const tvm::ffi::TensorView topk_scores,
++    const tvm::ffi::TensorView out,
++    const tvm::ffi::Optional<tvm::ffi::TensorView> norm_weight,
++    const tvm::ffi::Optional<tvm::ffi::TensorView> slot_expert_ids,
++    double eps,
++    bool round_product) {
++  using namespace host;
++
++  auto T = SymbolicSize{"num_tokens"};
++  auto K = SymbolicSize{"topk"};
++  auto H = SymbolicSize{"hidden_size"};
++  auto dev = SymbolicDevice{};
++  K.set_value(kTopK);
++  H.set_value(kHidden);
++  dev.set_options<kDLCUDA>();
++
++  TensorMatcher({T, K, H})
++      .with_dtype<bf16_t>()
++      .with_device<kDLCUDA>(dev)
++      .ensure_alignment(16)
++      .verify(expert_output);
++  TensorMatcher({T, K})
++      .with_dtype<fp32_t, bf16_t>()
++      .with_device<kDLCUDA>(dev)
++      .verify(topk_scores);
++  TensorMatcher({T, H})
++      .with_dtype<bf16_t>()
++      .with_device<kDLCUDA>(dev)
++      .ensure_alignment(16)
++      .verify(out);
++
++  if constexpr (kNormMode >= 2) {
++    RuntimeCheck(norm_weight.has_value(), "norm_weight is required for kNormMode >= 2");
++    TensorMatcher({H})
++        .with_dtype<bf16_t>()
++        .with_device<kDLCUDA>(dev)
++        .ensure_alignment(16)
++        .verify(norm_weight.value());
++  } else {
++    RuntimeCheck(!norm_weight.has_value(), "norm_weight must be null for kNormMode < 2");
++  }
++
++  if (slot_expert_ids.has_value()) {
++    TensorMatcher({T, K})
++        .with_dtype<int32_t>()
++        .with_device<kDLCUDA>(dev)
++        .verify(slot_expert_ids.value());
++  }
++
++  const int num_tokens = static_cast<int>(T.unwrap());
++  if (num_tokens == 0) return;
++
++  const DLDevice device = dev.unwrap();
++  const bool scores_bf16 = (host::dtype_bytes(topk_scores.dtype()) == 2);
++
++  const muse_spark::PostExpertFinalizeParams params{
++      .expert_output = expert_output.data_ptr(),
++      .norm_weight = norm_weight.has_value() ? norm_weight.value().data_ptr() : nullptr,
++      .topk_scores = topk_scores.data_ptr(),
++      .out = out.data_ptr(),
++      .slot_expert_ids = slot_expert_ids.has_value()
++          ? static_cast<const int32_t*>(slot_expert_ids.value().data_ptr())
++          : nullptr,
++      .eps = static_cast<float>(eps),
++      .num_tokens = num_tokens,
++      .scores_bf16 = scores_bf16,
++      .round_product = round_product,
++  };
++
++  const dim3 grid(static_cast<unsigned>(num_tokens));
++  LaunchKernel(grid, kNumThreads, device, 0)
++      .config({.use_pdl = kUsePDL})(
++          muse_spark::post_expert_finalize_kernel<kHidden, kNumThreads, kTopK, kNormMode, kUsePDL>,
++          params);
++}
++
++}  // namespace sglang
+diff --git a/python/sglang/kernels/ops/attention/muse_spark_qk_norm_rope_store.py b/python/sglang/kernels/ops/attention/muse_spark_qk_norm_rope_store.py
+index 235eecae..54ad4459 100644
+--- a/python/sglang/kernels/ops/attention/muse_spark_qk_norm_rope_store.py
++++ b/python/sglang/kernels/ops/attention/muse_spark_qk_norm_rope_store.py
+@@ -109,8 +109,8 @@ def _qk_rms_norm_fwd_kernel(
+         if FP8_KV_STORE:
+             x = tl.minimum(tl.maximum(x, -FP8_MAX), FP8_MAX)
+         loc = tl.load(CACHE_LOC + token, mask=row_mask, other=0).to(tl.int64)
+-        # Slot zero is reserved for CUDA-graph padding.
+-        kv_mask = mask & (loc != 0)[:, None]
++        # Slots <= 0 are non-physical: 0 is CUDA-graph padding, -1 is unmapped.
++        kv_mask = mask & (loc > 0)[:, None]
+         kv_head = tl.where(is_v, head - NUM_Q_HEADS - NUM_KV_HEADS, head - NUM_Q_HEADS)
+         kv_dst = loc * (NUM_KV_HEADS * D) + kv_head * D
+         tl.store(
+diff --git a/python/sglang/kernels/ops/moe/muse_spark_post_expert_finalize_jit.py b/python/sglang/kernels/ops/moe/muse_spark_post_expert_finalize_jit.py
+new file mode 100644
+index 00000000..7fbb44f1
+--- /dev/null
++++ b/python/sglang/kernels/ops/moe/muse_spark_post_expert_finalize_jit.py
+@@ -0,0 +1,176 @@
++"""Fused MuseSpark post-expert RMSNorm + active-slot combine (CUDA JIT).
++
++CUDA replacement for ``_post_expert_norm_weighted_sum_kernel`` in
++``sglang.kernels.ops.moe.muse_spark_post_expert_finalize_triton``. Uses
++warp-ballot pruning over ``slot_expert_ids >= 0``, fast zero-fill for tokens
++with zero local experts, ping-pong CTA reductions, and Programmatic Dependent
++Launch (PDL) on SM90+.
++"""
++
++from __future__ import annotations
++
++from typing import TYPE_CHECKING, Optional
++
++import torch
++
++from sglang.kernels.jit.utils import (
++    cache_once,
++    is_arch_support_pdl,
++    load_jit,
++    make_cpp_args,
++)
++
++if TYPE_CHECKING:
++    from tvm_ffi.module import Module
++
++_VEC = 8
++_THREAD_CHOICES = (256, 512, 1024, 128, 64, 32)
++
++
++def _select_num_threads(hidden: int) -> Optional[int]:
++    if hidden <= 0 or hidden % _VEC != 0:
++        return None
++    for threads in _THREAD_CHOICES:
++        if hidden % (threads * _VEC) == 0 and hidden // (threads * _VEC) <= 4:
++            return threads
++    for threads in _THREAD_CHOICES:
++        if hidden % (threads * _VEC) == 0:
++            return threads
++    return None
++
++
++def _select_norm_mode(
++    apply_norm: bool,
++    norm_weight: Optional[torch.Tensor],
++    weight_first: bool,
++) -> int:
++    if not apply_norm:
++        return 0
++    if norm_weight is None:
++        return 1
++    return 3 if weight_first else 2
++
++
++def is_jit_eligible(
++    expert_output: torch.Tensor,
++    topk_scores: torch.Tensor,
++    norm_weight: Optional[torch.Tensor] = None,
++    apply_norm: bool = True,
++    slot_expert_ids: Optional[torch.Tensor] = None,
++) -> bool:
++    """Return True if all tensor shapes, dtypes, and alignments match the CUDA JIT kernel."""
++    if (
++        not expert_output.is_cuda
++        or expert_output.dtype != torch.bfloat16
++        or expert_output.dim() != 3
++    ):
++        return False
++    tokens, topk, hidden = expert_output.shape
++    if (
++        tokens <= 0
++        or topk < 1
++        or topk > 32
++        or _select_num_threads(hidden) is None
++    ):
++        return False
++    if expert_output.is_contiguous() and expert_output.data_ptr() % 16 != 0:
++        return False
++    if (
++        topk_scores.device != expert_output.device
++        or topk_scores.shape != (tokens, topk)
++        or topk_scores.dtype not in (torch.float32, torch.bfloat16)
++    ):
++        return False
++    if apply_norm and norm_weight is not None:
++        if (
++            norm_weight.device != expert_output.device
++            or norm_weight.shape != (hidden,)
++            or norm_weight.dtype != torch.bfloat16
++        ):
++            return False
++        if norm_weight.is_contiguous() and norm_weight.data_ptr() % 16 != 0:
++            return False
++    if slot_expert_ids is not None:
++        if (
++            slot_expert_ids.device != expert_output.device
++            or slot_expert_ids.shape != (tokens, topk)
++            or slot_expert_ids.dtype not in (torch.int32, torch.int64)
++        ):
++            return False
++    return True
++
++
++@cache_once
++def _jit_module(
++    hidden: int,
++    num_threads: int,
++    topk: int,
++    norm_mode: int,
++) -> Module:
++    args = make_cpp_args(
++        hidden,
++        num_threads,
++        topk,
++        norm_mode,
++        is_arch_support_pdl(),
++    )
++    return load_jit(
++        "muse_spark_post_expert_finalize",
++        *args,
++        cuda_files=["muse_spark/post_expert_finalize.cuh"],
++        cuda_wrappers=[
++            (
++                "fused_post_expert_norm_weighted_sum",
++                f"fused_post_expert_norm_weighted_sum<{args}>",
++            )
++        ],
++    )
++
++
++def fused_post_expert_norm_weighted_sum_jit(
++    expert_output: torch.Tensor,
++    topk_scores: torch.Tensor,
++    norm_weight: Optional[torch.Tensor] = None,
++    eps: float = 1e-8,
++    weight_first: bool = True,
++    apply_norm: bool = True,
++    slot_expert_ids: Optional[torch.Tensor] = None,
++    round_product: bool = False,
++) -> torch.Tensor:
++    """Invoke the CUDA JIT post-expert finalize kernel on validated inputs."""
++    tokens, topk, hidden = expert_output.shape
++    num_threads = _select_num_threads(hidden)
++    assert num_threads is not None, f"Unsupported hidden dimension {hidden}"
++
++    x = expert_output if expert_output.is_contiguous() else expert_output.contiguous()
++    scores = topk_scores if topk_scores.is_contiguous() else topk_scores.contiguous()
++
++    norm_mode = _select_norm_mode(apply_norm, norm_weight, weight_first)
++    weight_in = None
++    if norm_mode >= 2 and norm_weight is not None:
++        weight_in = (
++            norm_weight if norm_weight.is_contiguous() else norm_weight.contiguous()
++        )
++
++    ids_in = None
++    if slot_expert_ids is not None:
++        ids_in = (
++            slot_expert_ids
++            if slot_expert_ids.dtype == torch.int32
++            else slot_expert_ids.to(torch.int32)
++        )
++        if not ids_in.is_contiguous():
++            ids_in = ids_in.contiguous()
++
++    out = torch.empty((tokens, hidden), dtype=torch.bfloat16, device=x.device)
++    module = _jit_module(hidden, num_threads, topk, norm_mode)
++    module.fused_post_expert_norm_weighted_sum(
++        x,
++        scores,
++        out,
++        weight_in,
++        ids_in,
++        float(eps),
++        bool(round_product),
++    )
++    return out
+diff --git a/python/sglang/kernels/ops/moe/muse_spark_post_expert_finalize_triton.py b/python/sglang/kernels/ops/moe/muse_spark_post_expert_finalize_triton.py
+index ed451fd0..ddf2b561 100644
+--- a/python/sglang/kernels/ops/moe/muse_spark_post_expert_finalize_triton.py
++++ b/python/sglang/kernels/ops/moe/muse_spark_post_expert_finalize_triton.py
+@@ -79,6 +79,30 @@ def fused_post_expert_norm_weighted_sum(
+     round_product preserves input-dtype multiplication before FP32 accumulation
+     when combining an already normalized low-precision tensor.
+     """
++    if expert_output.dim() == 3 and expert_output.shape[0] > 0:
++        from sglang.kernels.ops.moe.muse_spark_post_expert_finalize_jit import (
++            fused_post_expert_norm_weighted_sum_jit,
++            is_jit_eligible,
++        )
++
++        if is_jit_eligible(
++            expert_output,
++            topk_scores,
++            norm_weight=norm_weight,
++            apply_norm=apply_norm,
++            slot_expert_ids=slot_expert_ids,
++        ):
++            return fused_post_expert_norm_weighted_sum_jit(
++                expert_output,
++                topk_scores,
++                norm_weight=norm_weight,
++                eps=eps,
++                weight_first=weight_first,
++                apply_norm=apply_norm,
++                slot_expert_ids=slot_expert_ids,
++                round_product=round_product,
++            )
++
+     x = expert_output.contiguous()
+     tokens, topk, hidden = x.shape
+     out = torch.empty((tokens, hidden), dtype=x.dtype, device=x.device)
+diff --git a/python/sglang/srt/layers/attention/base_attn_backend.py b/python/sglang/srt/layers/attention/base_attn_backend.py
+index c04242cd..62764268 100644
+--- a/python/sglang/srt/layers/attention/base_attn_backend.py
++++ b/python/sglang/srt/layers/attention/base_attn_backend.py
+@@ -91,7 +91,10 @@ class AttentionBackend(ABC):
+     kv_index_translator = None
+ 
+     def get_fused_kv_write_buffers(
+-        self, layer: RadixAttention, forward_batch: ForwardBatch
++        self,
++        layer: RadixAttention,
++        forward_batch: ForwardBatch,
++        allow_fp8: bool = False,
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+         """Return token-major K/V buffers and physical slots for a fused writer."""
+         return None
+diff --git a/python/sglang/srt/layers/attention/flashattention_backend.py b/python/sglang/srt/layers/attention/flashattention_backend.py
+index 0b4ecf18..65f7b594 100644
+--- a/python/sglang/srt/layers/attention/flashattention_backend.py
++++ b/python/sglang/srt/layers/attention/flashattention_backend.py
+@@ -1433,43 +1433,86 @@ class FlashAttentionBackend(AttentionBackend):
+                 descale_shape = (logical_batch_size, kv_head_num)
+                 k_descale = layer.k_scale.expand(descale_shape)
+                 v_descale = layer.v_scale.expand(descale_shape)
+-            q = q.to(self.kv_cache_dtype)
++            if q.dtype != self.kv_cache_dtype:
++                q = q.to(self.kv_cache_dtype)
+             q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
+             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
+         return q, q_rope, k_rope, k_descale, v_descale
+ 
+-    def get_fused_kv_write_buffers(self, layer, forward_batch):
++    def get_fused_kv_write_buffers(
++        self, layer, forward_batch, allow_fp8: bool = False
++    ):
++        allowed_dtypes = (
++            (torch.bfloat16, torch.float8_e4m3fn) if allow_fp8 else (torch.bfloat16,)
++        )
++        if self.kv_cache_dtype not in allowed_dtypes:
++            return None
++        if self.kv_cache_dtype == torch.float8_e4m3fn and (
++            self.kv_cache_dtype_str == "auto"
++            or self.kv_cache_is_mxfp8
++            or self.fa_impl_ver == 4
++            or layer.head_dim > 256
++            or layer.k_scale is not None
++            or layer.v_scale is not None
++        ):
++            return None
+         if (
+-            self.kv_cache_dtype != torch.bfloat16
+-            or self.use_mla
++            self.use_mla
+             or layer.is_cross_attention
+-            or self.kv_index_translator.is_translating
++            or getattr(self.kv_index_translator, "is_translating", False)
+             or self._kv_shard_pool is not None
+             or self.fa_skip_kv_cache
++            or self.forward_metadata is None
++            or self.token_to_kv_pool is None
+             or layer.tp_k_head_num != layer.tp_v_head_num
+             or is_cp_active(forward_batch)
+             or forward_batch.dcp_kv_mask is not None
+         ):
+             return None
++        if forward_batch.out_cache_loc is None:
++            return None
+         write_loc = KVWriteLoc.for_layer(
+             forward_batch,
+             layer,
+             swa_loc=self.forward_metadata.swa_out_cache_loc,
+         )
+-        locations = (
+-            write_loc.swa_loc
+-            if self.use_sliding_window_kv_pool and layer.sliding_window_size >= 0
+-            else write_loc.loc
+-        )
++        if hasattr(self.token_to_kv_pool, "layers_mapping"):
++            mapping_entry = self.token_to_kv_pool.layers_mapping.get(layer.layer_id)
++            if mapping_entry is None:
++                return None
++            _, is_swa_layer = mapping_entry
++            sub_pool = (
++                self.token_to_kv_pool.swa_kv_pool
++                if is_swa_layer
++                else self.token_to_kv_pool.full_kv_pool
++            )
++            locations = write_loc.swa_loc if is_swa_layer else write_loc.loc
++        elif (
++            self.use_sliding_window_kv_pool
++            and layer.sliding_window_size is not None
++            and layer.sliding_window_size >= 0
++        ):
++            sub_pool = self.token_to_kv_pool
++            locations = write_loc.swa_loc
++        else:
++            sub_pool = self.token_to_kv_pool
++            locations = write_loc.loc
+         if locations is None:
+             return None
++        if (
++            getattr(sub_pool, "is_quantized_kv_cache", False)
++            or getattr(sub_pool, "dtype", self.kv_cache_dtype) != self.kv_cache_dtype
++            or getattr(sub_pool, "store_dtype", self.kv_cache_dtype)
++            != self.kv_cache_dtype
++        ):
++            return None
+         buffers = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+         shapes = (
+             (layer.tp_k_head_num, layer.head_dim),
+             (layer.tp_v_head_num, layer.v_head_dim),
+         )
+         for buffer, shape in zip(buffers, shapes):
+-            if buffer.shape[1:] != shape or buffer.stride()[-2:] != (shape[-1], 1):
++            if buffer.shape[1:] != shape or not buffer.is_contiguous():
+                 return None
+         return (*buffers, locations)
+ 
+diff --git a/python/sglang/srt/layers/attention/hybrid_attn_backend.py b/python/sglang/srt/layers/attention/hybrid_attn_backend.py
+index 38e80df1..5c670353 100644
+--- a/python/sglang/srt/layers/attention/hybrid_attn_backend.py
++++ b/python/sglang/srt/layers/attention/hybrid_attn_backend.py
+@@ -98,10 +98,12 @@ class HybridAttnBackend(AttentionBackend):
+             forward_batch, num_qo_tokens=num_qo_tokens
+         )
+ 
+-    def get_fused_kv_write_buffers(self, layer, forward_batch):
++    def get_fused_kv_write_buffers(
++        self, layer, forward_batch, allow_fp8: bool = False
++    ):
+         return self._select_backend(
+             forward_batch.forward_mode
+-        ).get_fused_kv_write_buffers(layer, forward_batch)
++        ).get_fused_kv_write_buffers(layer, forward_batch, allow_fp8=allow_fp8)
+ 
+     @property
+     def supports_full_cuda_graph_chunked_prefix(self) -> bool:
+diff --git a/python/sglang/srt/layers/muse_spark/muse_spark_fp4_moe.py b/python/sglang/srt/layers/muse_spark/muse_spark_fp4_moe.py
+index 41c463dc..a94c821e 100644
+--- a/python/sglang/srt/layers/muse_spark/muse_spark_fp4_moe.py
++++ b/python/sglang/srt/layers/muse_spark/muse_spark_fp4_moe.py
+@@ -382,6 +382,8 @@ class MuseSpark1xFp4Experts(nn.Module):
+         hidden_states: torch.Tensor,
+         topk_scores: torch.Tensor,
+         topk_ids: torch.Tensor,
++        *,
++        expert_ids_mapped: bool = False,
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+         """Project local routes; finalization skips undefined inactive slots."""
+         from sgl_kernel.scalar_type import scalar_types
+@@ -394,24 +396,34 @@ class MuseSpark1xFp4Experts(nn.Module):
+         )
+         from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
+ 
+-        hidden_states = hidden_states.contiguous()
++        if not hidden_states.is_contiguous():
++            hidden_states = hidden_states.contiguous()
+         num_tokens, size_k = hidden_states.shape
+         topk = topk_ids.shape[1]
+         size_n = self.intermediate_size_per_partition
+         gemm1_n = 2 * size_n
+         expert_map = self._expert_map
+ 
+-        local_topk_ids = topk_ids.to(torch.int32)
+-        if expert_map is not None:
++        local_topk_ids = (
++            topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32)
++        )
++        if not expert_ids_mapped and expert_map is not None:
+             local_topk_ids = _map_topk_ids_to_local_experts(local_topk_ids, expert_map)
+-        local_topk_ids = local_topk_ids.contiguous()
+-        topk_weights = topk_scores.to(torch.float32).contiguous()
++        if not local_topk_ids.is_contiguous():
++            local_topk_ids = local_topk_ids.contiguous()
++        topk_weights = (
++            topk_scores
++            if topk_scores.dtype == torch.float32
++            else topk_scores.to(torch.float32)
++        )
++        if not topk_weights.is_contiguous():
++            topk_weights = topk_weights.contiguous()
+ 
+         for block_size_m in _MARLIN_BLOCK_SIZE_M_CANDIDATES:
+             if num_tokens * topk / self.num_local_experts / block_size_m < 0.9:
+                 break
+ 
+-        if num_tokens == 1 and topk <= 32 and expert_map is None:
++        if num_tokens == 1 and topk <= 32:
+             from sglang.kernels.ops.moe.moe_align_single_token import (
+                 moe_align_single_token,
+             )
+@@ -422,16 +434,11 @@ class MuseSpark1xFp4Experts(nn.Module):
+                 )
+             )
+         else:
+-            align_num_experts = (
+-                self.global_num_experts
+-                if expert_map is not None
+-                else self.num_local_experts
+-            )
+             sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+                 local_topk_ids,
+                 block_size_m,
+-                align_num_experts,
+-                return_inactive_prefix_count=expert_map is None,
++                self.num_local_experts,
++                return_inactive_prefix_count=True,
+             )
+ 
+         # Both aligners emit ascending block IDs with inactive blocks first;
+@@ -468,7 +475,7 @@ class MuseSpark1xFp4Experts(nn.Module):
+             moe_block_size=block_size_m,
+             top_k=topk,
+             mul_topk_weights=False,
+-            is_ep=expert_map is not None,
++            is_ep=False,
+             b_q_type=scalar_types.float4_e2m1f,
+             size_m=num_tokens,
+             size_n=gemm1_n,
+@@ -478,7 +485,7 @@ class MuseSpark1xFp4Experts(nn.Module):
+             use_fp32_reduce=True,
+             is_zp_float=False,
+             expert_ids_are_sorted=True,
+-            has_inactive_prefix_count=expert_map is None,
++            has_inactive_prefix_count=True,
+         )
+         silu_and_mul(
+             cache1.view(-1, gemm1_n),
+@@ -504,7 +511,7 @@ class MuseSpark1xFp4Experts(nn.Module):
+             moe_block_size=block_size_m,
+             top_k=1,
+             mul_topk_weights=False,
+-            is_ep=expert_map is not None,
++            is_ep=False,
+             b_q_type=scalar_types.float4_e2m1f,
+             size_m=num_tokens * topk,
+             size_n=size_k,
+@@ -514,7 +521,7 @@ class MuseSpark1xFp4Experts(nn.Module):
+             use_fp32_reduce=True,
+             is_zp_float=False,
+             expert_ids_are_sorted=True,
+-            has_inactive_prefix_count=expert_map is None,
++            has_inactive_prefix_count=True,
+         ).view(num_tokens, topk, size_k), local_topk_ids
+ 
+     def _forward_marlin(
+@@ -524,6 +531,8 @@ class MuseSpark1xFp4Experts(nn.Module):
+         topk_ids: torch.Tensor,
+         post_expert_norm: Optional[nn.Module],
+         pre_expert_norm: Optional[nn.Module] = None,
++        *,
++        expert_ids_mapped: bool = False,
+     ) -> torch.Tensor:
+         if post_expert_norm is None:
+             raise ValueError(
+@@ -539,7 +548,10 @@ class MuseSpark1xFp4Experts(nn.Module):
+         if pre_expert_norm is not None:
+             hidden_states = pre_expert_norm(hidden_states)
+         expert_outputs, local_topk_ids = self._marlin_expert_outputs(
+-            hidden_states, topk_scores, topk_ids
++            hidden_states,
++            topk_scores,
++            topk_ids,
++            expert_ids_mapped=expert_ids_mapped,
+         )
+         if self._post_expert_norm is not post_expert_norm:
+             self.set_post_expert_norm(post_expert_norm)
+@@ -644,6 +656,7 @@ class MuseSpark1xFp4Experts(nn.Module):
+         ] = None,
+         *,
+         ar_workspace: FinalizePushWorkspace | None = None,
++        expert_ids_mapped: bool = False,
+     ) -> torch.Tensor:
+         if self.use_marlin:
+             return self._forward_marlin(
+@@ -652,6 +665,7 @@ class MuseSpark1xFp4Experts(nn.Module):
+                 topk_ids,
+                 post_expert_norm,
+                 pre_expert_norm=pre_expert_norm,
++                expert_ids_mapped=expert_ids_mapped,
+             )
+ 
+         from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
+diff --git a/python/sglang/srt/models/muse_spark.py b/python/sglang/srt/models/muse_spark.py
+index 6b638e9f..4028de39 100644
+--- a/python/sglang/srt/models/muse_spark.py
++++ b/python/sglang/srt/models/muse_spark.py
+@@ -94,6 +94,9 @@ from sglang.srt.model_executor.forward_context import (
+     get_attn_backend,
+     get_token_to_kv_pool,
+ )
++from sglang.srt.model_executor.runner_utils.prefill_graph import (
++    is_in_prefill_graph_scope,
++)
+ from sglang.srt.model_loader.weight_utils import default_weight_loader
+ from sglang.srt.runtime_context import get_forward, get_memory, get_parallel
+ from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
+@@ -368,33 +371,57 @@ class MuseSpark1xAttention(nn.Module):
+         )
+ 
+     def _fused_kv_store(
+-        self, forward_batch: ForwardBatch
++        self, forward_batch: ForwardBatch, qkv: torch.Tensor
+     ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+         # Unified pools interleave layers in each token row. Reuse the prefill
+         # path, whose attention-backend cache writer supports these strides.
+-        if get_memory().enable_unified_memory:
+-            return None
+-        backend = get_attn_backend()
+-        pool = get_token_to_kv_pool()
+-        if not (
+-            isinstance(backend, TRTLLMHAAttnBackend)
+-            and backend.data_type in (torch.bfloat16, torch.float8_e4m3fn)
+-            and pool.dtype == backend.data_type
+-            and (pool.dtype == torch.bfloat16 or not backend.is_xqa_impl)
+-            and self.attn.k_scale is None
+-            and self.attn.v_scale is None
+-            and forward_batch.dcp_kv_mask is None
+-            # Prefill excluded: the fused store segfaults at breakable prefill replay.
+-            and (
++        if (
++            get_memory().enable_unified_memory
++            or not (
+                 forward_batch.forward_mode.is_decode()
+                 or forward_batch.forward_mode.is_target_verify()
+             )
+-            and not is_cp_active(forward_batch)
++            or self.attn.k_scale is not None
++            or self.attn.v_scale is not None
++            or forward_batch.dcp_kv_mask is not None
++            or is_cp_active(forward_batch)
++            or torch.compiler.is_compiling()
++            or is_in_prefill_graph_scope()
++        ):
++            return None
++        backend = get_attn_backend()
++        if isinstance(backend, TRTLLMHAAttnBackend):
++            pool = get_token_to_kv_pool()
++            if not (
++                backend.data_type in (torch.bfloat16, torch.float8_e4m3fn)
++                and pool.dtype == backend.data_type
++                and (pool.dtype == torch.bfloat16 or not backend.is_xqa_impl)
++            ):
++                return None
++            cache_loc = backend._get_layer_cache_loc(self.attn, forward_batch)
++            k_cache = pool.get_key_buffer(self.layer_idx)
++            v_cache = pool.get_value_buffer(self.layer_idx)
++            return (
++                k_cache.view(k_cache.shape[0], -1),
++                v_cache.view(v_cache.shape[0], -1),
++                cache_loc,
++            )
++        get_buffers = getattr(backend, "get_fused_kv_write_buffers", None)
++        if get_buffers is None:
++            return None
++        try:
++            buffers = get_buffers(self.attn, forward_batch, allow_fp8=True)
++        except TypeError:
++            buffers = get_buffers(self.attn, forward_batch)
++        if buffers is None:
++            return None
++        k_cache, v_cache, cache_loc = buffers
++        if (
++            k_cache.dtype != v_cache.dtype
++            or k_cache.dtype not in (qkv.dtype, torch.float8_e4m3fn)
++            or cache_loc.shape[0] < qkv.shape[0]
+         ):
+             return None
+-        cache_loc = backend._get_layer_cache_loc(self.attn, forward_batch)
+-        k_cache = pool.get_key_buffer(self.layer_idx)
+-        v_cache = pool.get_value_buffer(self.layer_idx)
+         return (
+             k_cache.view(k_cache.shape[0], -1),
+             v_cache.view(v_cache.shape[0], -1),
+@@ -418,7 +445,7 @@ class MuseSpark1xAttention(nn.Module):
+             o_gate = None
+         fuse_rope = self._fused_qk_norm is not None and self.rotary_emb is not None
+         kv_store = (
+-            self._fused_kv_store(forward_batch)
++            self._fused_kv_store(forward_batch, qkv)
+             if self._fused_qk_norm is not None
+             and (self.rotary_emb is None or fuse_rope)
+             else None
+@@ -788,12 +815,19 @@ class MuseSpark1xMoE(nn.Module):
+                 hidden_states.float() if self.router_in_fp32 else hidden_states
+             )
+         sp_active = getattr(get_forward(), "sp_active", False)
++        use_marlin = bool(getattr(self.experts, "use_marlin", False))
+         prepare_early = (
+             self.nvfp4_checkpoint
+             # Measured to help up to 128 tokens (decode c<=128); untested above.
+             and hidden_states.shape[0] <= 128
+             and not sp_active
+-            and not getattr(self.experts, "use_marlin", False)
++            and not use_marlin
++        )
++        pre_norm_early = bool(
++            self.nvfp4_checkpoint
++            and use_marlin
++            and not sp_active
++            and self.pre_expert_norm is not None
+         )
+         prepared_input = None
+         use_side_stream = not _is_cpu and torch.cuda.is_available()
+@@ -823,6 +857,21 @@ class MuseSpark1xMoE(nn.Module):
+             prepared_input = self.experts.prepare_input(
+                 expert_input, self.pre_expert_norm
+             )
++        elif pre_norm_early:
++            expert_input = self.pre_expert_norm(expert_input)
++        capturer = get_global_experts_capturer()
++        expert_map = getattr(self.experts, "_expert_map", None)
++        fuse_expert_map = bool(
++            use_marlin
++            and not sp_active
++            and capturer is None
++            and expert_map is not None
++            and expert_map.device == hidden_states.device
++            and expert_map.dtype == torch.int32
++            and expert_map.is_contiguous()
++        )
++        routing_op = self._routing_op()
++        routing_op.set_local_expert_mapping(expert_map if fuse_expert_map else None)
+         with (
+             torch.cuda.stream(side_stream)
+             if use_side_stream
+@@ -833,22 +882,27 @@ class MuseSpark1xMoE(nn.Module):
+                 if use_split2
+                 else self.gate(router_input)
+             )
+-            topk_scores, topk_ids, packed_topk_ids = self._routing_op()(
+-                None, router_logits, self.top_k, True, want_packed=True
++            routing_out = routing_op(
++                None, router_logits, self.top_k, True, want_packed=not use_marlin
+             )
++            if len(routing_out) == 3:
++                topk_scores, topk_ids, packed_topk_ids = routing_out
++            else:
++                topk_scores, topk_ids = routing_out
++                packed_topk_ids = None
+         if use_side_stream:
+             main_stream.wait_stream(side_stream)
+         if use_side_stream and not torch.cuda.is_current_stream_capturing():
+             cross_stream_tensors = (
+                 (router_logits, topk_scores, topk_ids)
+-                if getattr(get_forward(), "sp_active", False)
++                if sp_active
+                 else (topk_scores, topk_ids, packed_topk_ids)
+             )
+             for tensor in cross_stream_tensors:
+                 if tensor is not None:
+                     tensor.record_stream(main_stream)
+ 
+-        if (capturer := get_global_experts_capturer()) is not None:
++        if capturer is not None:
+             # Capture on main after the router join, in full unpadded token order.
+             # SP experts below still consume the local ids.
+             capture_topk_ids = topk_ids
+@@ -857,7 +911,7 @@ class MuseSpark1xMoE(nn.Module):
+                     topk_ids, num_tokens=layernorm_sp.sp_num_tokens()
+                 )
+             capturer.capture(layer_id=self.layer_idx, topk_indices=capture_topk_ids)
+-        if getattr(get_forward(), "sp_active", False):
++        if sp_active:
+             return self._forward_sp_experts(
+                 expert_input, topk_scores, topk_ids, router_logits
+             )
+@@ -867,10 +921,11 @@ class MuseSpark1xMoE(nn.Module):
+                 topk_scores,
+                 topk_ids,
+                 self.experts.post_expert_norm,
+-                pre_expert_norm=self.pre_expert_norm,
++                pre_expert_norm=None if pre_norm_early else self.pre_expert_norm,
+                 prepared_input=prepared_input,
+                 packed_topk_ids=packed_topk_ids,
+                 ar_workspace=ar_workspace,
++                **({"expert_ids_mapped": True} if fuse_expert_map else {}),
+             )
+         else:
+             if self.pre_expert_norm is not None:

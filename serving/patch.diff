@@ -1,22 +1,247 @@
 diff --git a/python/sglang/srt/layers/muse_spark/muse_spark_fp4_moe.py b/python/sglang/srt/layers/muse_spark/muse_spark_fp4_moe.py
-index 41c463dc..0044b58d 100644
+index 41c463dc..a94c821e 100644
 --- a/python/sglang/srt/layers/muse_spark/muse_spark_fp4_moe.py
 +++ b/python/sglang/srt/layers/muse_spark/muse_spark_fp4_moe.py
-@@ -407,9 +407,14 @@ class MuseSpark1xFp4Experts(nn.Module):
-         local_topk_ids = local_topk_ids.contiguous()
-         topk_weights = topk_scores.to(torch.float32).contiguous()
+@@ -382,6 +382,8 @@ class MuseSpark1xFp4Experts(nn.Module):
+         hidden_states: torch.Tensor,
+         topk_scores: torch.Tensor,
+         topk_ids: torch.Tensor,
++        *,
++        expert_ids_mapped: bool = False,
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+         """Project local routes; finalization skips undefined inactive slots."""
+         from sgl_kernel.scalar_type import scalar_types
+@@ -394,24 +396,34 @@ class MuseSpark1xFp4Experts(nn.Module):
+         )
+         from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
  
--        for block_size_m in _MARLIN_BLOCK_SIZE_M_CANDIDATES:
--            if num_tokens * topk / self.num_local_experts / block_size_m < 0.9:
--                break
-+        if num_tokens == 32:
-+            block_size_m = 16
-+        elif num_tokens in (128, 256):
-+            block_size_m = 32
-+        else:
-+            for block_size_m in _MARLIN_BLOCK_SIZE_M_CANDIDATES:
-+                if num_tokens * topk / self.num_local_experts / block_size_m < 0.9:
-+                    break
+-        hidden_states = hidden_states.contiguous()
++        if not hidden_states.is_contiguous():
++            hidden_states = hidden_states.contiguous()
+         num_tokens, size_k = hidden_states.shape
+         topk = topk_ids.shape[1]
+         size_n = self.intermediate_size_per_partition
+         gemm1_n = 2 * size_n
+         expert_map = self._expert_map
  
-         if num_tokens == 1 and topk <= 32 and expert_map is None:
+-        local_topk_ids = topk_ids.to(torch.int32)
+-        if expert_map is not None:
++        local_topk_ids = (
++            topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32)
++        )
++        if not expert_ids_mapped and expert_map is not None:
+             local_topk_ids = _map_topk_ids_to_local_experts(local_topk_ids, expert_map)
+-        local_topk_ids = local_topk_ids.contiguous()
+-        topk_weights = topk_scores.to(torch.float32).contiguous()
++        if not local_topk_ids.is_contiguous():
++            local_topk_ids = local_topk_ids.contiguous()
++        topk_weights = (
++            topk_scores
++            if topk_scores.dtype == torch.float32
++            else topk_scores.to(torch.float32)
++        )
++        if not topk_weights.is_contiguous():
++            topk_weights = topk_weights.contiguous()
+ 
+         for block_size_m in _MARLIN_BLOCK_SIZE_M_CANDIDATES:
+             if num_tokens * topk / self.num_local_experts / block_size_m < 0.9:
+                 break
+ 
+-        if num_tokens == 1 and topk <= 32 and expert_map is None:
++        if num_tokens == 1 and topk <= 32:
              from sglang.kernels.ops.moe.moe_align_single_token import (
+                 moe_align_single_token,
+             )
+@@ -422,16 +434,11 @@ class MuseSpark1xFp4Experts(nn.Module):
+                 )
+             )
+         else:
+-            align_num_experts = (
+-                self.global_num_experts
+-                if expert_map is not None
+-                else self.num_local_experts
+-            )
+             sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+                 local_topk_ids,
+                 block_size_m,
+-                align_num_experts,
+-                return_inactive_prefix_count=expert_map is None,
++                self.num_local_experts,
++                return_inactive_prefix_count=True,
+             )
+ 
+         # Both aligners emit ascending block IDs with inactive blocks first;
+@@ -468,7 +475,7 @@ class MuseSpark1xFp4Experts(nn.Module):
+             moe_block_size=block_size_m,
+             top_k=topk,
+             mul_topk_weights=False,
+-            is_ep=expert_map is not None,
++            is_ep=False,
+             b_q_type=scalar_types.float4_e2m1f,
+             size_m=num_tokens,
+             size_n=gemm1_n,
+@@ -478,7 +485,7 @@ class MuseSpark1xFp4Experts(nn.Module):
+             use_fp32_reduce=True,
+             is_zp_float=False,
+             expert_ids_are_sorted=True,
+-            has_inactive_prefix_count=expert_map is None,
++            has_inactive_prefix_count=True,
+         )
+         silu_and_mul(
+             cache1.view(-1, gemm1_n),
+@@ -504,7 +511,7 @@ class MuseSpark1xFp4Experts(nn.Module):
+             moe_block_size=block_size_m,
+             top_k=1,
+             mul_topk_weights=False,
+-            is_ep=expert_map is not None,
++            is_ep=False,
+             b_q_type=scalar_types.float4_e2m1f,
+             size_m=num_tokens * topk,
+             size_n=size_k,
+@@ -514,7 +521,7 @@ class MuseSpark1xFp4Experts(nn.Module):
+             use_fp32_reduce=True,
+             is_zp_float=False,
+             expert_ids_are_sorted=True,
+-            has_inactive_prefix_count=expert_map is None,
++            has_inactive_prefix_count=True,
+         ).view(num_tokens, topk, size_k), local_topk_ids
+ 
+     def _forward_marlin(
+@@ -524,6 +531,8 @@ class MuseSpark1xFp4Experts(nn.Module):
+         topk_ids: torch.Tensor,
+         post_expert_norm: Optional[nn.Module],
+         pre_expert_norm: Optional[nn.Module] = None,
++        *,
++        expert_ids_mapped: bool = False,
+     ) -> torch.Tensor:
+         if post_expert_norm is None:
+             raise ValueError(
+@@ -539,7 +548,10 @@ class MuseSpark1xFp4Experts(nn.Module):
+         if pre_expert_norm is not None:
+             hidden_states = pre_expert_norm(hidden_states)
+         expert_outputs, local_topk_ids = self._marlin_expert_outputs(
+-            hidden_states, topk_scores, topk_ids
++            hidden_states,
++            topk_scores,
++            topk_ids,
++            expert_ids_mapped=expert_ids_mapped,
+         )
+         if self._post_expert_norm is not post_expert_norm:
+             self.set_post_expert_norm(post_expert_norm)
+@@ -644,6 +656,7 @@ class MuseSpark1xFp4Experts(nn.Module):
+         ] = None,
+         *,
+         ar_workspace: FinalizePushWorkspace | None = None,
++        expert_ids_mapped: bool = False,
+     ) -> torch.Tensor:
+         if self.use_marlin:
+             return self._forward_marlin(
+@@ -652,6 +665,7 @@ class MuseSpark1xFp4Experts(nn.Module):
+                 topk_ids,
+                 post_expert_norm,
+                 pre_expert_norm=pre_expert_norm,
++                expert_ids_mapped=expert_ids_mapped,
+             )
+ 
+         from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
+diff --git a/python/sglang/srt/models/muse_spark.py b/python/sglang/srt/models/muse_spark.py
+index 6b638e9f..64f1545b 100644
+--- a/python/sglang/srt/models/muse_spark.py
++++ b/python/sglang/srt/models/muse_spark.py
+@@ -788,12 +788,19 @@ class MuseSpark1xMoE(nn.Module):
+                 hidden_states.float() if self.router_in_fp32 else hidden_states
+             )
+         sp_active = getattr(get_forward(), "sp_active", False)
++        use_marlin = bool(getattr(self.experts, "use_marlin", False))
+         prepare_early = (
+             self.nvfp4_checkpoint
+             # Measured to help up to 128 tokens (decode c<=128); untested above.
+             and hidden_states.shape[0] <= 128
+             and not sp_active
+-            and not getattr(self.experts, "use_marlin", False)
++            and not use_marlin
++        )
++        pre_norm_early = bool(
++            self.nvfp4_checkpoint
++            and use_marlin
++            and not sp_active
++            and self.pre_expert_norm is not None
+         )
+         prepared_input = None
+         use_side_stream = not _is_cpu and torch.cuda.is_available()
+@@ -823,6 +830,21 @@ class MuseSpark1xMoE(nn.Module):
+             prepared_input = self.experts.prepare_input(
+                 expert_input, self.pre_expert_norm
+             )
++        elif pre_norm_early:
++            expert_input = self.pre_expert_norm(expert_input)
++        capturer = get_global_experts_capturer()
++        expert_map = getattr(self.experts, "_expert_map", None)
++        fuse_expert_map = bool(
++            use_marlin
++            and not sp_active
++            and capturer is None
++            and expert_map is not None
++            and expert_map.device == hidden_states.device
++            and expert_map.dtype == torch.int32
++            and expert_map.is_contiguous()
++        )
++        routing_op = self._routing_op()
++        routing_op.set_local_expert_mapping(expert_map if fuse_expert_map else None)
+         with (
+             torch.cuda.stream(side_stream)
+             if use_side_stream
+@@ -833,22 +855,27 @@ class MuseSpark1xMoE(nn.Module):
+                 if use_split2
+                 else self.gate(router_input)
+             )
+-            topk_scores, topk_ids, packed_topk_ids = self._routing_op()(
+-                None, router_logits, self.top_k, True, want_packed=True
++            routing_out = routing_op(
++                None, router_logits, self.top_k, True, want_packed=not use_marlin
+             )
++            if len(routing_out) == 3:
++                topk_scores, topk_ids, packed_topk_ids = routing_out
++            else:
++                topk_scores, topk_ids = routing_out
++                packed_topk_ids = None
+         if use_side_stream:
+             main_stream.wait_stream(side_stream)
+         if use_side_stream and not torch.cuda.is_current_stream_capturing():
+             cross_stream_tensors = (
+                 (router_logits, topk_scores, topk_ids)
+-                if getattr(get_forward(), "sp_active", False)
++                if sp_active
+                 else (topk_scores, topk_ids, packed_topk_ids)
+             )
+             for tensor in cross_stream_tensors:
+                 if tensor is not None:
+                     tensor.record_stream(main_stream)
+ 
+-        if (capturer := get_global_experts_capturer()) is not None:
++        if capturer is not None:
+             # Capture on main after the router join, in full unpadded token order.
+             # SP experts below still consume the local ids.
+             capture_topk_ids = topk_ids
+@@ -857,7 +884,7 @@ class MuseSpark1xMoE(nn.Module):
+                     topk_ids, num_tokens=layernorm_sp.sp_num_tokens()
+                 )
+             capturer.capture(layer_id=self.layer_idx, topk_indices=capture_topk_ids)
+-        if getattr(get_forward(), "sp_active", False):
++        if sp_active:
+             return self._forward_sp_experts(
+                 expert_input, topk_scores, topk_ids, router_logits
+             )
+@@ -867,10 +894,11 @@ class MuseSpark1xMoE(nn.Module):
+                 topk_scores,
+                 topk_ids,
+                 self.experts.post_expert_norm,
+-                pre_expert_norm=self.pre_expert_norm,
++                pre_expert_norm=None if pre_norm_early else self.pre_expert_norm,
+                 prepared_input=prepared_input,
+                 packed_topk_ids=packed_topk_ids,
+                 ar_workspace=ar_workspace,
++                **({"expert_ids_mapped": True} if fuse_expert_map else {}),
+             )
+         else:
+             if self.pre_expert_norm is not None:
